@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Mirror the I-ADOPT variable nanopublications from the nanopub network into this repository.
+"""Mirror the variables of the I-ADOPT space from the nanopub network into this repository.
 
-For every current (not retracted or superseded) nanopublication of type iop:Variable, the
-script keeps two files in OUT_DIR, both named after the nanopublication's artifact code:
+For every nanopublication that LIST_URL returns (the current, not retracted or superseded,
+variables that the I-ADOPT space page lists), the script keeps two files in OUT_DIR, both named
+after the nanopublication's artifact code:
 
   <code>.ttl   the assertion graph as plain Turtle, which the catalogue builds its pages from
   <code>.trig  the complete signed nanopublication, as published
 
 A nanopublication never changes, so a file that exists is never fetched again; only new
-nanopublications are downloaded, and the files of those that have been retracted or superseded
-are removed.
+nanopublications are downloaded, and the files of those that the list no longer contains
+(because they were retracted or superseded, or the list itself changed) are removed.
 
 Requires rdflib (pip install rdflib).
 """
@@ -19,29 +20,40 @@ import io
 import re
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from rdflib import Dataset, Graph, Literal, URIRef
+from rdflib import RDF, Dataset, Graph, Literal, URIRef
 from rdflib.namespace import Namespace
 
-# All current nanopublications of type iop:Variable (columns np, label, pubkey, date).
-# The router redirects to a query instance that is currently up.
-LIST_URL = (
-    "https://router.knowledgepixels.com/query/api/"
-    "RAE35dYJQlpnqim7VeKuu07E9I1LQUZpkdYQR4RvU3KMU/get-nanopubs-by-type.csv"
-    "?type=https%3A%2F%2Fw3id.org%2Fiadopt%2Font%2FVariable"
-)
-# A single nanopublication as TriG, from a registry that is currently up.
+# The variables of the I-ADOPT space: the query of the "I-ADOPT LLM Service Variables" view on
+# https://nanodash.knowledgepixels.com/space?id=https://w3id.org/spaces/I-ADOPT, which lists the
+# current variables published by the I-ADOPT LLM Service. The script runs the latest version of
+# this query, following its npx:supersedes chain, so a new version of the query is picked up
+# without changing anything here. Only its "np" column is used, so any query with such a column
+# works; if the space page gets a different variable query, put that one here.
+LIST_QUERY_NP = "https://w3id.org/np/RAtgmu16tM9HfgVvPk_C3cXLjDe1J9mbtBGHhDJYOQdQE"
+
+# The router redirects to a query instance or registry that is currently up.
+API_URL = "https://router.knowledgepixels.com/query/api/{code}/{name}.csv"
+# The latest version of a nanopublication along its supersedes chain (columns latest, date).
+LATEST_VERSION_URL = API_URL.format(code="RAiRsB2YywxjsBMkVRTREJBooXhf2ZOHoUs5lxciEl37I",
+                                    name="get-latest-version-of-np") + "?np={np}"
+# A single nanopublication as TriG.
 NANOPUB_URL = "https://router.knowledgepixels.com/registry/np/{code}.trig"
 
 OUT_DIR = Path(__file__).resolve().parent.parent / "Nanopublications"
 
-# Refuse to delete files when the list has shrunk by more than this fraction since the last run:
-# a query instance that is still loading can answer with an incomplete list.
+# Refuse to delete files when the list has shrunk by more than this fraction since the last run,
+# and by more than MAX_REMOVE_ANYWAY variables: a query instance that is still loading can
+# answer with an incomplete list. To switch to a query with a much smaller list, delete the files
+# that are no longer wanted in the same commit.
 MAX_SHRINK = 0.2
+MAX_REMOVE_ANYWAY = 5
 
 NP = Namespace("http://www.nanopub.org/nschema#")
+GRLC_QUERY = URIRef("https://w3id.org/kpxl/grlc/grlc-query")
 IOP = Namespace("https://w3id.org/iadopt/ont/")
 COMPONENT_PREDICATES = [IOP.hasProperty, IOP.hasObjectOfInterest, IOP.hasMatrix,
                         IOP.hasContextObject, IOP.hasStatisticalModifier, IOP.hasConstraint,
@@ -76,14 +88,49 @@ def fetch(url, accept, attempts=4):
             time.sleep(5 * attempt)
 
 
+def fetch_csv(url):
+    return list(csv.DictReader(io.StringIO(fetch(url, "text/csv"))))
+
+
+def artifact_code(uri):
+    code = uri.strip().rstrip("/").rsplit("/", 1)[-1]
+    return code if code.startswith("RA") and len(code) == 45 else None
+
+
+def latest_version(np_uri):
+    """Return the latest version of a nanopublication, or the nanopublication itself if the
+    latest version cannot be determined (e.g. because its chain has forked into two heads)."""
+    try:
+        rows = fetch_csv(LATEST_VERSION_URL.format(np=urllib.parse.quote(np_uri, safe="")))
+    except Exception as e:
+        print(f"  could not look up the latest version of {np_uri}: {e}", file=sys.stderr)
+        return np_uri
+    heads = {row["latest"].strip() for row in rows if artifact_code(row["latest"])}
+    if len(heads) != 1:
+        print(f"  found {len(heads)} latest versions of {np_uri}; using it as it is",
+              file=sys.stderr)
+        return np_uri
+    return heads.pop()
+
+
+def list_url():
+    """Return the API URL of the latest version of the list query."""
+    code = artifact_code(latest_version(LIST_QUERY_NP))
+    _, assertion = assertion_graph(fetch(NANOPUB_URL.format(code=code), "application/trig"))
+    queries = set(assertion.subjects(RDF.type, GRLC_QUERY))
+    if len(queries) != 1:
+        sys.exit(f"Nanopublication {code} defines {len(queries)} queries instead of one.")
+    return API_URL.format(code=code, name=str(queries.pop()).rsplit("/", 1)[-1])
+
+
 def list_nanopubs():
-    rows = list(csv.DictReader(io.StringIO(fetch(LIST_URL, "text/csv"))))
+    url = list_url()
+    print(f"Variables listed by {url}")
     codes = {}
-    for row in rows:
-        uri = row["np"].strip()
-        code = uri.rstrip("/").rsplit("/", 1)[-1]
-        if code.startswith("RA") and len(code) == 45:
-            codes[code] = uri
+    for row in fetch_csv(url):
+        code = artifact_code(row["np"])
+        if code:
+            codes[code] = row["np"].strip()
     return codes
 
 
@@ -98,7 +145,8 @@ def text_components(ttl):
             for o in graph.objects(None, p) if isinstance(o, Literal)]
 
 
-def assertion_turtle(trig):
+def assertion_graph(trig):
+    """Return the parsed nanopublication and its assertion graph."""
     ds = Dataset()
     ds.parse(data=trig, format="trig")
     assertion = None
@@ -107,6 +155,11 @@ def assertion_turtle(trig):
             assertion = a
     if not isinstance(assertion, URIRef):
         raise ValueError("no assertion graph found")
+    return ds, ds.graph(assertion)
+
+
+def assertion_turtle(trig):
+    ds, assertion = assertion_graph(trig)
     out = Graph()
     for prefix, namespace in PREFIXES.items():
         out.bind(prefix, namespace, override=True, replace=True)
@@ -115,7 +168,7 @@ def assertion_turtle(trig):
         if re.fullmatch(r"ns\d+", prefix) or prefix in ("", "this", "np", "npx", "nt"):
             continue
         out.bind(prefix, namespace, override=False)
-    for triple in ds.graph(assertion):
+    for triple in assertion:
         out.add(triple)
     if len(out) == 0:
         raise ValueError("assertion graph is empty")
@@ -130,7 +183,7 @@ def main():
 
     existing = {p.stem for p in OUT_DIR.glob("*.ttl")} | {p.stem for p in OUT_DIR.glob("*.trig")}
     gone = existing - set(current)
-    if existing and len(gone) > MAX_SHRINK * len(existing):
+    if len(gone) > max(MAX_REMOVE_ANYWAY, MAX_SHRINK * len(existing)):
         sys.exit(f"The list would remove {len(gone)} of {len(existing)} variables; "
                  "this looks like an incomplete answer, so nothing is changed.")
 
